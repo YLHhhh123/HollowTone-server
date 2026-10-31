@@ -1,0 +1,13 @@
+# Build artifacts
+/hollowtone-server
+/hollowtone-server.exe
+
+# Local runtime data (SQLite DB, media objects, uploads, art)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.jwt_secret
+
+# Local env
+.env
