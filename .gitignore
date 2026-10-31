@@ -1,6 +1,7 @@
 # Build artifacts
 /hollowtone-server
 /hollowtone-server.exe
+/dist/
 
 # Local runtime data (SQLite DB, media objects, uploads, art)
 data/
