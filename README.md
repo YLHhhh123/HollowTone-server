@@ -17,7 +17,11 @@ HollowTone 的个人服务器端：为本地音乐播放器提供**云端歌曲�
 | 流式播放 | `Range` 支持，客户端可拖动进度条 seek |
 | 封面 / 歌词 | 独立资源上传（内容寻址），也可绑定到 Track 的 `artKey` |
 | 播放列表同步 | 整表条目有序替换，版本化 LWW |
+| 可观测性 | `GET /healthz`（DB 探测失败返回 503）、`GET /version`（版本 / commit / 构建时间） |
+| 安全加固 | 对象键白名单校验、登录限流、分块上传总量上限、可选 CORS、代理信任开关 |
+| 传输优化 | 内容寻址即 ETag，`Cache-Control: immutable`，保留 `sendfile` 快路径 |
 | 部署 | Dockerfile + docker-compose + 一键脚本（Windows / Linux / macOS） |
+| 发布构建 | `scripts/build-all.ps1` / `scripts/build-all.sh` 交叉编译 + SHA256SUMS |
 
 ---
 
@@ -26,24 +30,30 @@ HollowTone 的个人服务器端：为本地音乐播放器提供**云端歌曲�
 ### 方式一：本地直接运行
 
 ```bash
-cd server
 # Windows
 run.bat
 # Linux / macOS
 sh run.sh
 ```
 
-默认监听 `:8080`，数据写入 `server/data/`。
+默认监听 `:8080`，数据写入 `./data/`。
 
 ### 方式二：Docker
 
 ```bash
-cd server
 cp .env.example .env        # 按需修改
 docker compose up -d --build
 ```
 
-数据持久化在 `server/data/`（挂载到容器 `/data`）。
+数据持久化在 `./data/`（挂载到容器 `/data`）。
+
+### 方式三：用预编译二进制
+
+```bash
+# 从 release 分支或 Release 页下载，校验后运行
+sha256sum -c SHA256SUMS.txt
+HT_DATA_DIR=./data HT_ADDR=:8080 ./hollowtone-server-linux-amd64
+```
 
 ### 首次使用
 
@@ -56,6 +66,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/auth/register \
 
 # 2) 之后所有请求带上
 #    Authorization: Bearer <token>
+
+# 3) 确认线上版本
+curl -s http://127.0.0.1:8080/version
 ```
 
 ---
@@ -68,7 +81,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/auth/register \
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/healthz` | 存活与 DB 状态 |
+| GET | `/healthz` | 存活与 DB 状态；DB 不可用返回 **503**，便于编排系统与探活直接判定 |
+| GET | `/version` | 构建身份：`version` / `commit` / `buildTime` / `goVersion` / `platform` |
 | POST | `/api/v1/auth/register` | 注册 `{username,password}` |
 | POST | `/api/v1/auth/login` | 登录 |
 | GET | `/api/v1/me` | 当前用户 |
@@ -130,17 +144,18 @@ curl -X POST http://127.0.0.1:8080/api/v1/auth/register \
 ## 🗂️ 目录结构
 
 ```
-server/
-├── cmd/hollowtone-server/main.go   # 入口：加载配置、启动 HTTP、优雅退出
+.
+├── cmd/hollowtone-server/main.go   # 入口：加载配置、启动 HTTP、清理协程、优雅退出
 ├── internal/
 │   ├── config/    # 环境变量配置与默认值
 │   ├── store/     # SQLite schema / 迁移 / users·tracks·playlists 持久化
-│   ├── storage/   # 内容寻址对象存储 + 分块上传暂存
+│   ├── storage/   # 内容寻址对象存储 + 分块上传暂存 + 过期清理
 │   ├── auth/      # JWT 签发/校验 + 中间件
-│   └── api/       # HTTP 路由与 handler
+│   ├── version/   # 构建身份（版本/commit/构建时间）
+│   └── api/       # HTTP 路由、handler、中间件（日志/CORS/限流）
 ├── smoke/         # 端到端冒烟测试（go run ./smoke）
-├── Dockerfile
-├── docker-compose.yml
+├── scripts/       # 交叉编译发布脚本（PowerShell / sh）
+├── Dockerfile / docker-compose.yml / .dockerignore
 ├── .env.example
 ├── run.bat / run.sh
 └── README.md
@@ -158,24 +173,56 @@ server/
 | `HT_JWT_SECRET` | 自动生成并存 `<data>/.jwt_secret` | Token 签名密钥，生产建议固定 |
 | `HT_TOKEN_TTL` | `720h` | Token 有效期 |
 | `HT_ALLOW_REGISTER` | `true` | 是否开放注册（首个账号始终可注册） |
-| `HT_MAX_UPLOAD_BYTES` | `2147483648` (2 GiB) | 单次整文件上传上限 |
+| `HT_MAX_UPLOAD_BYTES` | `2147483648` (2 GiB) | 单次整文件上传上限，同时也是**单个分块上传会话的总量上限** |
 | `HT_CHUNK_SIZE` | `8388608` (8 MiB) | 分块上传建议分片大小 |
+| `HT_UPLOAD_TTL` | `24h` | 未完成的分块上传保留时长，超时由清理协程删除 |
+| `HT_JANITOR_INTERVAL` | `1h` | 清理协程扫描间隔；设为 `0` 关闭 |
+| `HT_CORS_ORIGINS` | 空（关闭） | 允许调用 API 的浏览器 Origin，逗号分隔（Flutter Web 需要） |
+| `HT_TRUST_PROXY` | `false` | 仅置于可信反代后开启；开启后才采信 `X-Forwarded-For` |
 
 ## 🧪 测试
 
 ```bash
-# 启动服务器后
+# 单元测试：对象键白名单（目录穿越回归）、限流、CORS、代理地址解析
+go test ./...
+
+# 端到端冒烟（需先启动服务器）
 go run ./smoke -base http://127.0.0.1:8080
 ```
 
-覆盖：注册 → 登录 → 建 track → LWW 冲突(409) → 分块上传 → 合并 → 流式下载字节一致 → Range(206) → 播放列表 → 资源上传 → 全量/增量同步 → 删除墓碑。
+冒烟覆盖：注册 → 登录 → 建 track → LWW 冲突(409) → 分块上传 → 合并 → 流式下载字节一致 → Range(206) → 播放列表 → 资源上传 → 全量/增量同步 → 删除墓碑。
+
+## 📦 构建与发布
+
+```bash
+# Windows
+pwsh -File scripts/build-all.ps1                       # 版本号取自 git describe
+pwsh -File scripts/build-all.ps1 -Version v0.2.0       # 显式指定
+
+# Linux / macOS
+sh scripts/build-all.sh
+VERSION=v0.2.0 sh scripts/build-all.sh
+```
+
+脚本会先跑 `go test` 与 `go vet`，再交叉编译到 `dist/`（默认 linux/amd64、linux/arm64、windows/amd64），
+并把 `version` / `commit` / `buildTime` 注入二进制，最后生成 `SHA256SUMS.txt` 与 `dist/README.md`。
+
+线上确认版本：
+
+```bash
+curl -s http://127.0.0.1:8080/version
+```
 
 ## 🔒 安全说明
 
-- 密码使用 bcrypt 哈希存储。
-- Token 为 HS256 JWT；`HT_JWT_SECRET` 请在生产环境设置为足够长的随机串。
+- 密码使用 bcrypt 哈希存储；Token 为 HS256 JWT，`HT_JWT_SECRET` 生产环境请设为足够长的随机串。
+- **对象键白名单**：`/assets/{key}`、`/tracks/{guid}/art` 只接受 64 位十六进制内容地址，
+  `../` 之类构造会被判为 404，无法读取对象目录以外的文件（含 `.jwt_secret`）。
+- **登录限流**：同一客户端 5 分钟内最多 10 次失败尝试，超出返回 `429` 并带 `Retry-After`；登录成功后额度清零。
+- **上传总量上限**：单个分块上传会话的累计字节超过 `HT_MAX_UPLOAD_BYTES` 即返回 `413`，避免用不存在的分片号无限占用磁盘。
+- **代理信任默认关闭**：未显式开启 `HT_TRUST_PROXY` 时不采信 `X-Forwarded-For`，防止伪造来源绕过限流。
 - 服务默认 HTTP 明文，公网部署请前置 TLS 反向代理（Caddy / Nginx）。
-- 内容寻址存储天然去重；同名不同内容不会互相覆盖。
+- 内容寻址存储天然去重；同名不同内容不会互相覆盖，且同一音频可被多条曲目引用。
 
 ---
 

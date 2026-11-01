@@ -3,25 +3,9 @@ package api
 import (
 	"errors"
 	"net/http"
-	"time"
 
-	"github.com/luolingy/HollowTone/server/internal/store"
+	"github.com/YLHhhh123/HollowTone-server/internal/store"
 )
-
-// handleHealth reports liveness plus a DB ping.
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	dbStatus := "ok"
-	if err := s.store.DB().Ping(); err != nil {
-		dbStatus = "error"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "ok",
-		"db":             dbStatus,
-		"uptimeSeconds":  int64(time.Since(s.start).Seconds()),
-		"maxUploadBytes": s.cfg.MaxUploadBytes,
-		"chunkSize":      s.cfg.ChunkSize,
-	})
-}
 
 type authRequest struct {
 	Username string `json:"username"`
@@ -40,6 +24,10 @@ type authResponse struct {
 // handleRegister creates an account. Registration is allowed when the server
 // is configured to permit it, or for the very first user (bootstrap).
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	limitKey, ok := s.throttleApply(w, r, "register")
+	if !ok {
+		return
+	}
 	var req authRequest
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -61,11 +49,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.authLimiter.reset(limitKey)
 	s.issue(w, user)
 }
 
 // handleLogin authenticates and returns a token.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	limitKey, ok := s.throttleApply(w, r, "login")
+	if !ok {
+		return
+	}
 	var req authRequest
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -76,6 +69,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
+	// Successful sign-in clears the budget so typos do not lock the owner out.
+	s.authLimiter.reset(limitKey)
 	s.issue(w, user)
 }
 

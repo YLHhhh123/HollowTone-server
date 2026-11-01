@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/luolingy/HollowTone/server/internal/store"
+	"github.com/YLHhhh123/HollowTone-server/internal/store"
 )
 
 // handleSync returns everything changed since a watermark so clients can mirror

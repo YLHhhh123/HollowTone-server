@@ -73,10 +73,10 @@ func main() {
 	// 5. upsert track
 	guid := fmt.Sprintf("track-%d", time.Now().UnixNano())
 	trackIn := map[string]any{
-		"title":      "Test Song",
-		"artist":     "Tester",
-		"album":      "Smoke",
-		"durationMs": 123456,
+		"title":       "Test Song",
+		"artist":      "Tester",
+		"album":       "Smoke",
+		"durationMs":  123456,
 		"baseVersion": 0,
 	}
 	var track map[string]any

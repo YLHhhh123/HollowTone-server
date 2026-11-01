@@ -8,15 +8,15 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/luolingy/HollowTone/server/internal/api"
-	"github.com/luolingy/HollowTone/server/internal/config"
-	"github.com/luolingy/HollowTone/server/internal/storage"
-	"github.com/luolingy/HollowTone/server/internal/store"
+	"github.com/YLHhhh123/HollowTone-server/internal/api"
+	"github.com/YLHhhh123/HollowTone-server/internal/config"
+	"github.com/YLHhhh123/HollowTone-server/internal/storage"
+	"github.com/YLHhhh123/HollowTone-server/internal/store"
+	"github.com/YLHhhh123/HollowTone-server/internal/version"
 )
 
 func main() {
@@ -39,31 +39,48 @@ func main() {
 		log.Fatalf("storage: %v", err)
 	}
 
+	// Cancelled on SIGINT/SIGTERM; also stops the upload janitor.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Abandoned resumable uploads would otherwise pin disk space forever.
+	stor.StartJanitor(ctx, cfg.JanitorInterval, cfg.UploadTTL)
+
 	srv := api.New(cfg, st, stor)
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		// No global WriteTimeout: large audio streams may take a while.
+		// No global ReadTimeout/WriteTimeout: uploads and large audio streams
+		// are legitimately long-lived; they are bounded by body limits instead.
 		IdleTimeout: 120 * time.Second,
 	}
 
+	info := version.Current()
+	log.Printf("hollowtone-server %s (commit %s, built %s, %s, %s)",
+		info.Version, info.Commit, info.BuildTime, info.GoVersion, info.Platform)
+	if info.VCSModified {
+		log.Printf("warning: built from a modified working tree; version identity is approximate")
+	}
+
+	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("listening on %s (data=%s)", cfg.Addr, cfg.DataDir)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
-		}
+		errCh <- httpServer.ListenAndServe()
 	}()
 
-	// Graceful shutdown on SIGINT/SIGTERM.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http server: %v", err)
+		}
+	case <-ctx.Done():
+	}
 
 	log.Println("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := httpServer.Shutdown(ctx); err != nil {
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
 	log.Println("bye")

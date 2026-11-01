@@ -5,16 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/luolingy/HollowTone/server/internal/auth"
-	"github.com/luolingy/HollowTone/server/internal/config"
-	"github.com/luolingy/HollowTone/server/internal/storage"
-	"github.com/luolingy/HollowTone/server/internal/store"
+	"github.com/YLHhhh123/HollowTone-server/internal/auth"
+	"github.com/YLHhhh123/HollowTone-server/internal/config"
+	"github.com/YLHhhh123/HollowTone-server/internal/storage"
+	"github.com/YLHhhh123/HollowTone-server/internal/store"
+)
+
+// maxAuthAttempts is how many failed credential attempts one client may make
+// per authWindow before the API answers 429.
+const (
+	maxAuthAttempts = 10
+	authWindow      = 5 * time.Minute
 )
 
 // Server bundles the dependencies of the HTTP API.
@@ -24,16 +29,19 @@ type Server struct {
 	storage *storage.Store
 	tokens  *auth.Manager
 	start   time.Time
+	// authLimiter throttles credential endpoints per client address.
+	authLimiter *limiter
 }
 
 // New constructs the API server.
 func New(cfg *config.Config, st *store.Store, stor *storage.Store) *Server {
 	return &Server{
-		cfg:     cfg,
-		store:   st,
-		storage: stor,
-		tokens:  auth.New(cfg.JWTSecret, cfg.TokenTTL),
-		start:   time.Now(),
+		cfg:         cfg,
+		store:       st,
+		storage:     stor,
+		tokens:      auth.New(cfg.JWTSecret, cfg.TokenTTL),
+		start:       time.Now(),
+		authLimiter: newLimiter(maxAuthAttempts, authWindow),
 	}
 }
 
@@ -43,6 +51,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Public endpoints.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
 	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 
@@ -72,7 +81,7 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("POST /api/v1/uploads/{uploadId}/finalize", s.handleUploadFinalize)
 
 	mux.Handle("/api/v1/", s.tokens.Middleware(protected))
-	return logging(mux)
+	return logging(cors(s.cfg.CORSOrigins, mux))
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -89,32 +98,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
 }
 
+// readJSON decodes a JSON request body with a size cap. Unknown fields are
+// ignored on purpose: the client evolves faster than the server, and rejecting
+// extra fields would turn a forward-compatible client into a hard failure.
 func readJSON(r *http.Request, dst any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	return nil
-}
-
-func logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: 200}
-		next.ServeHTTP(sw, r)
-		log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, sw.status, time.Since(start))
-	})
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
+	return dec.Decode(dst)
 }
 
 // userID extracts the authenticated user, or writes 401 and returns false.
@@ -146,5 +135,16 @@ func writeConflict(w http.ResponseWriter, current any) {
 
 func isNotFound(err error) bool { return errors.Is(err, store.ErrNotFound) }
 
-// trimPath strips a leading slash for key lookups.
-func trimPath(p string) string { return strings.TrimPrefix(p, "/") }
+// throttleApply enforces the credential-attempt budget for this client,
+// answering 429 with Retry-After when it is exhausted.
+func (s *Server) throttleApply(w http.ResponseWriter, r *http.Request, scope string) (string, bool) {
+	key := scope + "|" + clientIP(r, s.cfg.TrustProxy)
+	ok, wait := s.authLimiter.allow(key)
+	if ok {
+		return key, true
+	}
+	secs := int(wait.Seconds()) + 1
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeErr(w, http.StatusTooManyRequests, "too many attempts, retry later")
+	return key, false
+}

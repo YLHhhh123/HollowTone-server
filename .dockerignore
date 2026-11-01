@@ -1,0 +1,12 @@
+# Keep the build context small and deterministic.
+.git
+.github
+dist
+data
+_probe
+*.exe
+hollowtone-server
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env

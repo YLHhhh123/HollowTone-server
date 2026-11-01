@@ -178,13 +178,6 @@ func (s *Store) GetTrack(userID int64, guid string) (*Track, error) {
 	return t, err
 }
 
-// TrackChange is a lightweight record used by the incremental sync endpoint.
-type TrackChange struct {
-	GUID    string `json:"guid"`
-	Version int64  `json:"version"`
-	Deleted bool   `json:"deleted"`
-}
-
 // ListTracksSince returns every track changed at or after sinceTS (updated_at),
 // including tombstones so clients can mirror deletions. When sinceTS is 0 the
 // full library is returned.
