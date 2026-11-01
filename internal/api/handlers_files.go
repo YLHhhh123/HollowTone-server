@@ -4,10 +4,15 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 
-	"github.com/luolingy/HollowTone/server/internal/storage"
+	"github.com/YLHhhh123/HollowTone-server/internal/storage"
 )
+
+// maxChunkCount bounds the number of chunks a single resumable upload may
+// declare, mirroring the storage layer's own guard.
+const maxChunkCount = 100_000
 
 // handleAttachFile accepts a whole-file upload for a track (simple path) and
 // binds the resulting object to it. Large files should use the chunked upload
@@ -60,7 +65,7 @@ func (s *Server) handleStreamTrack(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := s.storage.OpenObject(track.FileKey)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrInvalidKey) {
 			writeErr(w, http.StatusNotFound, "object missing")
 			return
 		}
@@ -68,16 +73,7 @@ func (s *Server) handleStreamTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "stat object failed")
-		return
-	}
-	w.Header().Set("Content-Type", "audio/mpeg")
-	w.Header().Set("Accept-Ranges", "bytes")
-	// http.ServeContent handles Range, If-Modified-Since and HEAD for us.
-	http.ServeContent(w, r, track.GUID, fi.ModTime(), f)
+	s.serveStored(w, r, f, track.FileKey)
 }
 
 // handleTrackArt streams the cover art bound to a track.
@@ -106,10 +102,10 @@ func (s *Server) handleUploadAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"key":     key,
-		"sha256":  hash,
-		"size":    size,
-		"url":     "/api/v1/assets/" + key,
+		"key":    key,
+		"sha256": hash,
+		"size":   size,
+		"url":    "/api/v1/assets/" + key,
 	})
 }
 
@@ -124,7 +120,9 @@ func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveArt(w http.ResponseWriter, r *http.Request, key string) {
 	f, err := s.storage.OpenArt(key)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
+		// An invalid key is reported as "missing" on purpose: telling a caller
+		// that a path was rejected would leak the validation rules.
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrInvalidKey) {
 			writeErr(w, http.StatusNotFound, "asset missing")
 			return
 		}
@@ -132,28 +130,47 @@ func (s *Server) serveArt(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "stat asset failed")
-		return
-	}
-	w.Header().Set("Content-Type", sniffContentType(key))
-	w.Header().Set("Accept-Ranges", "bytes")
-	http.ServeContent(w, r, key, fi.ModTime(), f)
+	s.serveStored(w, r, f, key)
 }
 
-func sniffContentType(key string) string {
-	switch {
-	case len(key) >= 4 && key[len(key)-4:] == ".jpg":
-		return "image/jpeg"
-	case len(key) >= 4 && key[len(key)-4:] == ".png":
-		return "image/png"
-	case len(key) >= 4 && key[len(key)-4:] == ".lrc":
-		return "text/plain; charset=utf-8"
-	default:
-		// Content-addressed art keys have no extension; default to image.
+// serveStored writes a stored object with an accurate Content-Type, a strong
+// ETag derived from its content address, and long-lived immutable caching.
+//
+// Content-addressed keys carry no file extension, so the type has to be
+// sniffed from the bytes; relying on the key produced
+// application/octet-stream for every cover image, which browsers refuse to
+// render inline.
+func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, f *os.File, key string) {
+	fi, err := f.Stat()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "stat object failed")
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", detectContentType(f))
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("ETag", `"`+key+`"`)
+	// Content is immutable: the key is the SHA-256 of the bytes.
+	h.Set("Cache-Control", "private, max-age=31536000, immutable")
+	// ServeContent handles Range, If-Range, If-None-Match and HEAD for us.
+	http.ServeContent(w, r, "", fi.ModTime(), f)
+}
+
+// detectContentType sniffs the leading bytes of f and rewinds it so the caller
+// can stream the whole file.
+func detectContentType(f *os.File) string {
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
 		return "application/octet-stream"
 	}
+	if err != nil && err != io.EOF {
+		return "application/octet-stream"
+	}
+	if n == 0 {
+		return "application/octet-stream"
+	}
+	return http.DetectContentType(buf[:n])
 }
 
 // --- resumable chunked uploads ---------------------------------------------
@@ -175,8 +192,16 @@ func (s *Server) handleUploadInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	if req.TotalChunks < 0 || req.TotalChunks > maxChunkCount {
+		writeErr(w, http.StatusBadRequest, "invalid totalChunks")
+		return
+	}
 	if req.Target == "" {
 		req.Target = "media"
+	}
+	if req.Target != "media" && req.Target != "art" {
+		writeErr(w, http.StatusBadRequest, "invalid target")
+		return
 	}
 	received, _ := s.storage.ReceivedChunks(uploadID)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -185,6 +210,7 @@ func (s *Server) handleUploadInit(w http.ResponseWriter, r *http.Request) {
 		"totalChunks": req.TotalChunks,
 		"target":      req.Target,
 		"received":    received,
+		"maxBytes":    s.cfg.MaxUploadBytes,
 	})
 }
 
@@ -194,14 +220,18 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	uploadID := r.PathValue("uploadId")
 	index, err := strconv.Atoi(r.PathValue("index"))
-	if err != nil || index < 0 {
+	if err != nil || index < 0 || index > maxChunkCount {
 		writeErr(w, http.StatusBadRequest, "invalid chunk index")
 		return
 	}
 	// Each chunk is at most the advertised chunk size plus a small margin.
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.ChunkSize+(1<<20))
-	n, err := s.storage.WriteChunk(uploadID, index, r.Body)
+	n, err := s.storage.WriteChunk(uploadID, index, r.Body, s.cfg.MaxUploadBytes)
 	if err != nil {
+		if errors.Is(err, storage.ErrTooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "upload exceeds maximum size")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "chunk write failed: "+err.Error())
 		return
 	}
@@ -225,8 +255,8 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uploadId": uploadID,
-		"received": received,
+		"uploadId":  uploadID,
+		"received":  received,
 		"chunkSize": s.cfg.ChunkSize,
 	})
 }
@@ -236,7 +266,6 @@ type finalizeRequest struct {
 	Target      string `json:"target"`
 	// GUID optionally binds the finished object to a track.
 	GUID string `json:"guid"`
-	// ComputeHash is always true for content addressing; kept for clarity.
 }
 
 func (s *Server) handleUploadFinalize(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +279,7 @@ func (s *Server) handleUploadFinalize(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.TotalChunks <= 0 {
+	if req.TotalChunks <= 0 || req.TotalChunks > maxChunkCount {
 		writeErr(w, http.StatusBadRequest, "totalChunks required")
 		return
 	}

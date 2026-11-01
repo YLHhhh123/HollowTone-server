@@ -1,4 +1,4 @@
-module github.com/luolingy/HollowTone/server
+module github.com/YLHhhh123/HollowTone-server
 
 go 1.26
 

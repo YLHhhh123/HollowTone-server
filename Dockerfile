@@ -3,13 +3,23 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 
+# Build identity, injected so GET /version identifies the running image.
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_TIME=unknown
+
 # Cache dependencies separately from source.
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /out/hollowtone-server ./cmd/hollowtone-server
+RUN go build -trimpath \
+        -ldflags="-s -w \
+          -X github.com/YLHhhh123/HollowTone-server/internal/version.Version=${VERSION} \
+          -X github.com/YLHhhh123/HollowTone-server/internal/version.Commit=${COMMIT} \
+          -X github.com/YLHhhh123/HollowTone-server/internal/version.BuildTime=${BUILD_TIME}" \
+        -o /out/hollowtone-server ./cmd/hollowtone-server
 
 # Runtime stage — scratch-level minimal image.
 FROM alpine:3.20

@@ -63,7 +63,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // DB exposes the raw handle for health checks and advanced queries.
 func (s *Store) DB() *sql.DB { return s.db }
 
-const schemaVersion = 1
+// schemaVersion is recorded so future migrations can branch on it.
+const schemaVersion = 2
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -100,7 +101,11 @@ func (s *Store) migrate() error {
 			deleted      INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tracks_user_updated ON tracks(user_id, updated_at)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_content ON tracks(user_id, content_hash) WHERE content_hash IS NOT NULL AND deleted = 0`,
+		// Deliberately NOT unique. The object store already deduplicates bytes,
+		// and two library entries may legitimately reference the same audio
+		// file; the previous UNIQUE index made the second bind fail with a 500.
+		`DROP INDEX IF EXISTS idx_tracks_content`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_content_hash ON tracks(user_id, content_hash) WHERE content_hash IS NOT NULL AND deleted = 0`,
 
 		`CREATE TABLE IF NOT EXISTS playlists (
 			guid       TEXT PRIMARY KEY,

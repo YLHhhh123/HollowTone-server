@@ -36,8 +36,18 @@ type Config struct {
 	ChunkSize int64
 	// AllowRegister enables the public /auth/register endpoint.
 	AllowRegister bool
-	// TrustedProxies is reserved for future reverse-proxy setups.
-	TrustedProxies []string
+	// TrustProxy makes the server honour X-Forwarded-For / X-Real-IP when
+	// resolving the caller address. Only enable it behind a reverse proxy you
+	// control, otherwise clients can spoof their address.
+	TrustProxy bool
+	// CORSOrigins lists the browser origins allowed to call the API. Empty
+	// disables CORS entirely (the mobile client does not need it).
+	CORSOrigins []string
+	// UploadTTL is how long an unfinished resumable upload is kept before the
+	// janitor removes it.
+	UploadTTL time.Duration
+	// JanitorInterval is how often stale uploads are swept. Zero disables it.
+	JanitorInterval time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -49,17 +59,19 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Addr:        env("HT_ADDR", ":8080"),
-		DataDir:     dataDir,
-		DBPath:      env("HT_DB_PATH", filepath.Join(dataDir, "hollowtone_server.sqlite")),
-		MediaDir:    env("HT_MEDIA_DIR", filepath.Join(dataDir, "media")),
-		ArtDir:      env("HT_ART_DIR", filepath.Join(dataDir, "art")),
-		TokenTTL:    envDuration("HT_TOKEN_TTL", 30*24*time.Hour),
+		Addr:          env("HT_ADDR", ":8080"),
+		DataDir:       dataDir,
+		DBPath:        env("HT_DB_PATH", filepath.Join(dataDir, "hollowtone_server.sqlite")),
+		MediaDir:      env("HT_MEDIA_DIR", filepath.Join(dataDir, "media")),
+		ArtDir:        env("HT_ART_DIR", filepath.Join(dataDir, "art")),
+		TokenTTL:      envDuration("HT_TOKEN_TTL", 30*24*time.Hour),
 		AllowRegister: envBool("HT_ALLOW_REGISTER", true),
 	}
 
 	cfg.MaxUploadBytes = envInt64("HT_MAX_UPLOAD_BYTES", 2<<30) // 2 GiB
-	cfg.ChunkSize = envInt64("HT_CHUNK_SIZE", 8<<20)           // 8 MiB
+	cfg.ChunkSize = envInt64("HT_CHUNK_SIZE", 8<<20)            // 8 MiB
+	cfg.UploadTTL = envDuration("HT_UPLOAD_TTL", 24*time.Hour)
+	cfg.JanitorInterval = envDuration("HT_JANITOR_INTERVAL", 1*time.Hour)
 
 	if err := cfg.ensureDirs(); err != nil {
 		return nil, err
@@ -77,11 +89,26 @@ func Load() (*Config, error) {
 	}
 	cfg.JWTSecret = []byte(secret)
 
-	if envBool("HT_TRUSTED_PROXY_ALL", false) {
-		cfg.TrustedProxies = []string{"0.0.0.0/0"}
-	}
+	// Legacy switch kept for compatibility with existing deployments.
+	cfg.TrustProxy = envBool("HT_TRUSTED_PROXY_ALL", false) || envBool("HT_TRUST_PROXY", false)
+	cfg.CORSOrigins = splitList(os.Getenv("HT_CORS_ORIGINS"))
 
 	return cfg, nil
+}
+
+// splitList parses a comma-separated environment list, dropping blanks.
+func splitList(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *Config) ensureDirs() error {
