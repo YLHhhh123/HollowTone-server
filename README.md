@@ -250,3 +250,5 @@ curl -s http://127.0.0.1:8080/version
 
 - 后端 GUID 由客户端生成（`track-<微秒>-<随机>`），因此两端无需共享自增主键即可收敛。
 - 云来源曲目只保存元数据与文件引用；实际音频通过 `GET /tracks/{guid}/stream` 流式播放，随播随取，不落本地缓存（除非你另行实现下载）。
+
+<!-- history attribution corrected -->
